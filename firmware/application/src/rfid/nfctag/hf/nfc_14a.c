@@ -456,9 +456,8 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
                         }
                         return;
                     default: {
-                        // After receiving the wrong level instruction, directly reset the status machine
-                        NRF_LOG_INFO("[MFEMUL_SELECT] Incorrect cascade level received: %02x", p_data[0]);
-                        m_tag_state_14a = NFC_TAG_STATE_14A_IDLE;
+                        // Unknown command in READY: ignore, stay READY
+                        NRF_LOG_INFO("[MFEMUL_SELECT] Unknown command in READY, ignored: %02x", p_data[0]);
                         return;
                     }
                 }
@@ -508,20 +507,26 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
                 // BCC calculation, complete the final anti -collision data preparation
                 nfc_tag_14a_append_bcc(uid, 4);
             } else {
-                // Receive the grade joint instructions of the error length, reset the status machine
-                m_tag_state_14a = NFC_TAG_STATE_14A_IDLE;
+                // Too short for a selection frame: ignore, stay READY
+                NRF_LOG_INFO("[MFEMUL_SELECT] Short frame in READY (%d bits), ignored", szDataBits);
                 return;
             }
-            // Incoming SELECT ALL for any cascade level
-            if (szDataBits == 16 && p_data[1] == 0x20) {
-                if (!m_sniff_passive) {
-                    nfc_tag_14a_tx_bytes(uid, 5, false);
+            // NVB: high nibble = complete bytes, low nibble = extra bits
+            uint8_t nvb       = p_data[1];
+            uint8_t nvb_bytes = (nvb >> 4) & 0x0F;
+            uint8_t nvb_bits  = nvb & 0x0F;
+
+            // SELECT CLx: 9 bytes, CRC_A included
+            if (nvb == 0x70) {
+                if (szDataBits != 72) {
+                    NRF_LOG_INFO("[MFEMUL_SELECT] SELECT CLx with unexpected length: %d bits", szDataBits);
+                    return;
                 }
-                // NRF_LOG_INFO("[MFEMUL_SELECT] SEL Reply.");
-                break;
-            }
-            // Incoming SELECT CLx for any cascade level
-            if (szDataBits == 72 && p_data[1] == 0x70) {
+                if (!nfc_tag_14a_checks_crc(p_data, 9)) {
+                    // Bad CRC: ignore, stay READY
+                    NRF_LOG_WARNING("[MFEMUL_SELECT] SELECT CLx with bad CRC, ignored");
+                    return;
+                }
                 if (memcmp(&p_data[2], uid, 4) == 0) {
                     bool cl_finished = (*auto_coll_res->size == NFC_TAG_14A_UID_SINGLE_SIZE && level == NFC_TAG_14A_CASCADE_LEVEL_1) ||
                                        (*auto_coll_res->size == NFC_TAG_14A_UID_DOUBLE_SIZE && level == NFC_TAG_14A_CASCADE_LEVEL_2) ||
@@ -546,9 +551,54 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
                 }
                 break;
             }
-            // Unknown selection procedure
-            m_tag_state_14a = NFC_TAG_STATE_14A_IDLE;
-            // NRF_LOG_INFO("[MFEMUL_SELECT] Unknown selection procedure");
+
+            // Bit oriented anti-collision: NVB 0x21 .. 0x67
+            if (nvb_bits != 0) {
+                uint8_t m = (uint8_t)(nvb_bytes - 2);   // complete UID bytes given
+                uint8_t mask, rx, ref;
+
+                if (nvb_bytes < 2 || nvb_bytes > 6 || m >= 4 || nvb_bits > 7) {
+                    NRF_LOG_INFO("[MFEMUL_SELECT] Invalid bit oriented NVB=%02x", nvb);
+                    return;
+                }
+                if (szDataBits < ((uint16_t)nvb_bytes * 8 + nvb_bits)) {
+                    NRF_LOG_INFO("[MFEMUL_SELECT] Truncated bit oriented frame NVB=%02x", nvb);
+                    return;
+                }
+                if (m > 0 && memcmp(&p_data[2], uid, m) != 0) {
+                    return;
+                }
+                // Partial byte packing is not documented: accept right/left aligned or zeroed
+                mask = (uint8_t)((1u << nvb_bits) - 1u);
+                rx   = p_data[2 + m];
+                ref  = uid[m];
+                if (!(((rx & mask) == (ref & mask)) ||               /* right aligned */
+                      ((rx >> (8 - nvb_bits)) == (ref & mask)) ||   /* left aligned  */
+                      ((rx & mask) == 0))) {                        /* bits not usable */
+                    NRF_LOG_INFO("[MFEMUL_SELECT] AC prefix mismatch NVB=%02x rx=%02x uid=%02x", nvb, rx, ref);
+                    return;
+                }
+                if (!m_sniff_passive) {
+                    nfc_tag_14a_tx_bytes(uid, 5, false);
+                }
+                break;
+            }
+
+            // Anti-collision CLx: NVB 0x20 = no UID bytes known yet, 0x30 .. 0x60 = the
+            // reader supplies 1..4 UID bytes (fast select, e.g. "93 60 <uid>")
+            if (nvb_bytes < 2 || nvb_bytes > 6) {
+                NRF_LOG_INFO("[MFEMUL_SELECT] Unsupported anti-collision NVB=%02x", nvb);
+                return;
+            }
+            if (szDataBits < ((uint16_t)nvb_bytes * 8)) {
+                return;
+            }
+            if (nvb_bytes == 2 || memcmp(&p_data[2], uid, nvb_bytes - 2) == 0) {
+                if (!m_sniff_passive) {
+                    nfc_tag_14a_tx_bytes(uid, 5, false);
+                }
+            }
+            // UID mismatch: stay silent, stay READY
             break;
         }
         // Activation status, re-post processing of any message

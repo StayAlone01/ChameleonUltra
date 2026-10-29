@@ -516,7 +516,7 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
             uint8_t nvb_bytes = (nvb >> 4) & 0x0F;
             uint8_t nvb_bits  = nvb & 0x0F;
 
-            // SELECT CLx: 9 bytes, CRC_A included
+            // SELECT CLx (NVB 0x70): 9 bytes, UID + BCC + CRC_A. Replies with a SAK.
             if (nvb == 0x70) {
                 if (szDataBits != 72) {
                     NRF_LOG_INFO("[MFEMUL_SELECT] SELECT CLx with unexpected length: %d bits", szDataBits);
@@ -584,8 +584,8 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
                 break;
             }
 
-            // Anti-collision CLx: NVB 0x20 = no UID bytes known yet, 0x30 .. 0x60 = the
-            // reader supplies 1..4 UID bytes (fast select, e.g. "93 60 <uid>")
+            // Byte-oriented anti-collision CLx (NVB 0x20 .. 0x60): no CRC.
+            // Replies with the remaining UID CLn bytes, followed by the BCC.
             if (nvb_bytes < 2 || nvb_bytes > 6) {
                 NRF_LOG_INFO("[MFEMUL_SELECT] Unsupported anti-collision NVB=%02x", nvb);
                 return;
@@ -593,9 +593,12 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
             if (szDataBits < ((uint16_t)nvb_bytes * 8)) {
                 return;
             }
-            if (nvb_bytes == 2 || memcmp(&p_data[2], uid, nvb_bytes - 2) == 0) {
-                if (!m_sniff_passive) {
-                    nfc_tag_14a_tx_bytes(uid, 5, false);
+            {
+                uint8_t m = (uint8_t)(nvb_bytes - 2);   // UID bytes the reader already knows
+                if (m == 0 || memcmp(&p_data[2], uid, m) == 0) {
+                    if (!m_sniff_passive) {
+                        nfc_tag_14a_tx_bytes(&uid[m], 5 - m, false);
+                    }
                 }
             }
             // UID mismatch: stay silent, stay READY
